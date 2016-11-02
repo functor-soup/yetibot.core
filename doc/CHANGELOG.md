@@ -1,6 +1,6 @@
 # yetibot.core change log
 
-## 1.0.0
+## 0.4.0
 
 - Refactor configuration:
   It was getting quite unweidly and inconsistent with somewhat arbitrary
