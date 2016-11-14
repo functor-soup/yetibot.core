@@ -1,16 +1,20 @@
 (ns yetibot.core.handler
   (:require
-    [taoensso.timbre :refer [info warn error]]
-    [yetibot.core.util :refer [with-fresh-db]]
-    [yetibot.core.util.format :refer [to-coll-if-contains-newlines format-exception-log]]
-    [yetibot.core.parser :refer [parse-and-eval transformer parser]]
+    [clojure.core.async :refer [timeout chan go <! >! >!! <!! alts!]]
     [clojure.core.match :refer [match]]
-    [clojure.core.async :refer [timeout chan go <! >! >!! <!!]]
-    [yetibot.core.chat :refer [chat-data-structure]]
-    [yetibot.core.interpreter :as interp]
+    [clojure.stacktrace :as st]
     [clojure.string :refer [join]]
+    [taoensso.timbre :refer [info warn error]]
+    [yetibot.core.chat :refer [chat-data-structure]]
+    [yetibot.core.config :refer [get-config]]
+    [yetibot.core.interpreter :as interp]
     [yetibot.core.models.help :as help]
-    [clojure.stacktrace :as st]))
+    [yetibot.core.parser :refer [parse-and-eval transformer parser]]
+    [yetibot.core.util :refer [with-fresh-db]]
+    [yetibot.core.util.format :refer [to-coll-if-contains-newlines format-exception-log]]))
+
+;; timeout is measured in milliseconds
+(def timeout-time (or (get-config :timeout) 3000))
 
 (defn handle-unparsed-expr
   "Top-level entry point for parsing and evaluation of commands"
@@ -52,7 +56,7 @@
        ; ensure prefix is actually a command
        (filter #(command? (-> % second second second)))))
 
-(defn handle-raw
+(defn handle-raw-command
   "No-op handler for optional hooks.
    Expected event-types are:
    :message
@@ -62,27 +66,36 @@
    :kick"
   [chat-source user event-type body]
   ; only :message has a body
-  (go
-    (when body
-      ; see if it looks like a command
-      (when-let [parsed-cmds
-                 (or
-                   ; if it starts with a command prefix (!) it's a command
-                   (when-let [[_ body] (re-find #"^\!(.+)" body)]
-                     [(parser body)])
-                   ; otherwise, check to see if there are embedded commands
-                   (embedded-cmds body))]
-        (with-fresh-db
-          (doall
-            (map
-              #(try
-                 (->> %
-                      (handle-parsed-expr chat-source user)
-                      chat-data-structure)
-                 (catch Throwable ex
-                   (error "error handling expression:" body
-                          (format-exception-log ex))
-                   (chat-data-structure (format exception-format ex))))
-              parsed-cmds)))))))
+  ; see if it looks like a command
+  (when-let [parsed-cmds
+             (or
+              ; if it starts with a command prefix (!) it's a command
+              (when-let [[_ body] (re-find #"^\!(.+)" body)]
+                [(parser body)])
+              ; otherwise, check to see if there are embedded commands
+              (embedded-cmds body))]
+    (with-fresh-db
+      (doall
+       (map
+        #(try
+           (handle-parsed-expr chat-source user %)
+           (catch Throwable ex
+             (error "error handling expression:" body
+                    (format-exception-log ex))
+             (format exception-format ex)))
+        parsed-cmds)))))
+
+(defn handle-raw
+  [chat-source user event-type body
+   & {:keys [timeout-ms] :or {timeout-ms timeout-time}}]
+  (go (when body
+        (let [input (chan)]
+          (go (>! input (handle-raw-command chat-source user event-type body)))
+          (let [[chat-output channel]
+                (alts! [input (timeout timeout-ms)])]
+            (condp = chat-output
+              nil (chat-data-structure "Operation timed out")
+              '() nil
+              (chat-data-structure chat-output)))))))
 
 (defn cmd-reader [& args] (handle-unparsed-expr (join " " args)))
