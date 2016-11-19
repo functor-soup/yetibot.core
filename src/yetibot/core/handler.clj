@@ -14,7 +14,12 @@
     [yetibot.core.util.format :refer [to-coll-if-contains-newlines format-exception-log]]))
 
 ;; timeout is measured in milliseconds
-(def timeout-time (or (get-config :timeout) 3000))
+(def soft-timeout-time (or (get-config :soft-timeout) 1))
+(def hard-timeout-time (or (get-config :hard-timeout) 1))
+
+(def timeout-messages
+  {:soft-timeout "This seems to be taking long ... still working on it"
+   :hard-timeout "Process took too long. Timeout out!!"})
 
 (defn handle-unparsed-expr
   "Top-level entry point for parsing and evaluation of commands"
@@ -87,14 +92,25 @@
 
 (defn handle-raw
   [chat-source user event-type body
-   & {:keys [timeout-ms] :or {timeout-ms timeout-time}}]
+   & {:keys [timeout-ms input-chan] :or {timeout-ms soft-timeout-time input-chan nil}}]
   (go (when body
-        (let [input (chan)]
-          (go (>! input (handle-raw-command chat-source user event-type body)))
+        (let [input (if input-chan
+                      input-chan
+                      (chan))
+              message (if input-chan
+                        (:hard-timeout timeout-messages)
+                        (:soft-timeout timeout-messages))]
+          (if-not input-chan
+            (go (>! input (handle-raw-command chat-source user event-type body))))
           (let [[chat-output channel]
                 (alts! [input (timeout timeout-ms)])]
             (condp = chat-output
-              nil (chat-data-structure "Operation timed out")
+              nil (do
+                    (if-not input-chan
+                      (handle-raw chat-source user event-type body
+                                  :timeout-ms hard-timeout-time
+                                  :input-chan input))
+                    (chat-data-structure message))
               '() nil
               (chat-data-structure chat-output)))))))
 

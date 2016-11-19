@@ -133,11 +133,13 @@
   (rh/add-hook
     #'yetibot.core.handler/handle-raw
     (let [event-types (set event-types)]
-      (fn [callback chat-source user event-type body]
+      (fn [callback chat-source user event-type body & rest]
         (when (contains? event-types event-type)
           (with-fresh-db
             (observer {:chat-source chat-source
                        :event-type event-type
                        :user user
                        :body body})))
-        (callback chat-source user event-type body)))))
+        (if rest
+          (apply callback chat-source user event-type body rest)
+          (callback chat-source user event-type body))))))
