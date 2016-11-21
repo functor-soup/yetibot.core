@@ -14,8 +14,13 @@
     [yetibot.core.util.format :refer [to-coll-if-contains-newlines format-exception-log]]))
 
 ;; timeout is measured in milliseconds
-(def soft-timeout-time (or (get-config :soft-timeout) 1))
-(def hard-timeout-time (or (get-config :hard-timeout) 1))
+(def soft-timeout-time (or (get-config :soft-timeout) 3000))
+;; logic is so make sure hard-time-out is creater than soft-time-out
+(def hard-timeout-time (let [val (get-config :hard-timeout)
+                             default 10000]
+                         (if (or (nil? val) (< val soft-timeout-time))
+                           default
+                           val)))
 
 (def timeout-messages
   {:soft-timeout "This seems to be taking long ... still working on it"
@@ -61,7 +66,32 @@
        ; ensure prefix is actually a command
        (filter #(command? (-> % second second second)))))
 
-(defn handle-raw-command
+(defn quacks-like-a-command?
+  [body]
+  (let [command  (or
+                  ;; if it starts with a command prefix (!) it's a command
+                  (when-let [[_ body] (re-find #"^\!(.+)" body)]
+                    [(parser body)])
+                  ;; otherwise, check to see if there are embedded commands
+                  (embedded-cmds body))]
+    (if-not (or (nil? command)
+                (empty? (seq command)))
+      command)))
+
+(defn process-raw-command
+  [chat-source user org-body parsed-cmds]
+  (with-fresh-db
+    (doall
+     (map
+      #(try
+         (handle-parsed-expr chat-source user %)
+         (catch Throwable ex
+           (error "error handling expression:" org-body
+                  (format-exception-log ex))
+           (format exception-format ex)))
+      parsed-cmds))))
+
+(defn handle-raw
   "No-op handler for optional hooks.
    Expected event-types are:
    :message
@@ -69,49 +99,27 @@
    :enter
    :sound
    :kick"
-  [chat-source user event-type body]
-  ; only :message has a body
-  ; see if it looks like a command
-  (when-let [parsed-cmds
-             (or
-              ; if it starts with a command prefix (!) it's a command
-              (when-let [[_ body] (re-find #"^\!(.+)" body)]
-                [(parser body)])
-              ; otherwise, check to see if there are embedded commands
-              (embedded-cmds body))]
-    (with-fresh-db
-      (doall
-       (map
-        #(try
-           (handle-parsed-expr chat-source user %)
-           (catch Throwable ex
-             (error "error handling expression:" body
-                    (format-exception-log ex))
-             (format exception-format ex)))
-        parsed-cmds)))))
-
-(defn handle-raw
   [chat-source user event-type body
    & {:keys [timeout-ms input-chan] :or {timeout-ms soft-timeout-time input-chan nil}}]
-  (go (when body
+  (when body
+    (when-let [command (quacks-like-a-command? body)]
+      (go
         (let [input (if input-chan
                       input-chan
-                      (chan))
-              message (if input-chan
-                        (:hard-timeout timeout-messages)
-                        (:soft-timeout timeout-messages))]
-          (if-not input-chan
-            (go (>! input (handle-raw-command chat-source user event-type body))))
-          (let [[chat-output channel]
-                (alts! [input (timeout timeout-ms)])]
-            (condp = chat-output
-              nil (do
-                    (if-not input-chan
-                      (handle-raw chat-source user event-type body
-                                  :timeout-ms hard-timeout-time
-                                  :input-chan input))
-                    (chat-data-structure message))
-              '() nil
-              (chat-data-structure chat-output)))))))
+                      (go
+                        (process-raw-command chat-source user body command)))
+                 message (if input-chan
+                           (:hard-timeout timeout-messages)
+                           (:soft-timeout timeout-messages))]
+             (let [[chat-output channel]
+                   (alts! [input (timeout timeout-ms)])]
+               (condp = chat-output
+                 nil (do
+                       (if-not input-chan
+                         (handle-raw chat-source user event-type body
+                                     :timeout-ms hard-timeout-time
+                                     :input-chan input))
+                       (chat-data-structure message))
+                 (chat-data-structure chat-output))))))))
 
 (defn cmd-reader [& args] (handle-unparsed-expr (join " " args)))
